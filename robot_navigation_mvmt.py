@@ -11,27 +11,41 @@ Color sensor on port 1 identifies colors using Euclidean distance.
 from utils.brick import Motor, EV3GyroSensor, EV3ColorSensor, configure_ports, busy_sleep
 import math
 import threading
+
+
+# CONSTANTS 
+
 # --------------------------------------------------------------------------
 # COLOR SENSOR CALIBRATION
 # --------------------------------------------------------------------------
+
 # ---- RED ---------------------------------------------------------------
 GREEN_R_MEAN   = 0.433900
 GREEN_G_MEAN   = 0.520179
 GREEN_B_MEAN   = 0.045921
+
 # ---- YELLOW ------------------------------------------------------------
 YELLOW_R_MEAN = 0.570138
 YELLOW_G_MEAN = 0.368785
 YELLOW_B_MEAN = 0.061077
+
 # ---- GREEN -------------------------------------------------------------
 RED_R_MEAN  = 0.896804
 RED_G_MEAN  = 0.070061
 RED_B_MEAN  = 0.033135
+
+
 # Color centroids as (R, G, B) tuples — used for Euclidean distance
 COLOR_CENTROIDS = {
     "red":    (RED_R_MEAN,    RED_G_MEAN,    RED_B_MEAN),
     "yellow": (YELLOW_R_MEAN, YELLOW_G_MEAN, YELLOW_B_MEAN),
     "green":  (GREEN_R_MEAN,  GREEN_G_MEAN,  GREEN_B_MEAN),
 }
+
+
+green_counter = 0
+
+
 # --------------------------------------------------------------------------
 # ROBOT CONFIGURATION
 # --------------------------------------------------------------------------
@@ -44,6 +58,8 @@ RIGHT_MOTOR_FLIPPED = False
 DRIVE_KP = 8.0
 DRIVE_KI = 0.1
 DRIVE_KD = 2.0
+
+
 # Average multiple gyro reads per PID cycle to reduce noise on short drives.
 GYRO_SAMPLES_PER_CYCLE = 5
 TURN_KP = 6.0
@@ -51,6 +67,10 @@ TURN_KI = 0.05
 TURN_KD = 1.5
 TURN_TOLERANCE_DEG  = 1.0
 DRIVE_CORRECTION_HZ = 50
+
+
+
+
 WHEEL_CIRCUMFERENCE_CM = math.pi * WHEEL_DIAMETER_CM
 MEASUREMENT_NB       = 8
 SWEEP_ANGLE          = -30
@@ -622,6 +642,9 @@ def room_navigation():
             throw_brick()
             busy_sleep(1.0)
 
+
+            green_counter += 1
+            
             # 5. Drive 2 cm backward after throwing
             print("  Reversing 2 cm after throw...")
             drive_backward(2.0)
