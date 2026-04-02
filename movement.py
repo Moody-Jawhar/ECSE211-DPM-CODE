@@ -1,8 +1,26 @@
-from utils.brick import Motor, EV3GyroSensor, EV3ColorSensor, TouchSensor, configure_ports, busy_sleep
+from utils.brick import Motor, EV3GyroSensor, EV3UltrasonicSensor, EV3ColorSensor, TouchSensor, configure_ports, busy_sleep
 import math
 import threading
-from config_ports import COLOR_SENSOR, TOUCH_SENSOR, GYRO, LEFT_MOTOR, RIGHT_MOTOR, CONVEYOR, ROTATING_MOTOR as COLOR_SENSOR, TOUCH_SENSOR, GYRO, LEFT_MOTOR, RIGHT_MOTOR, CONVEYOR, ROTATING_MOTOR
+import brickpi3
 
+BP = brickpi3.BrickPi3()
+
+
+
+
+
+COLOR_SENSOR, TOUCH_SENSOR, GYRO, ULTRA, LEFT_MOTOR, RIGHT_MOTOR, CONVEYOR, ROTATING_MOTOR = configure_ports(
+    PORT_1=EV3ColorSensor,
+    PORT_2=TouchSensor,
+    PORT_3=EV3GyroSensor,
+    PORT_4=EV3UltrasonicSensor,
+    PORT_A=Motor,
+    PORT_B=Motor,
+    PORT_C=Motor,
+    PORT_D=Motor,
+)
+
+busy_sleep(3.0)  # FIX 1: sensors need time to initialize before use
 
 #diameter of one of the wheels
 WHEEL_DIAMETER_CM   = 4
@@ -171,8 +189,8 @@ def drive_forward(distance_cm: float):
             derivative = (error - prev_error) / dt
             prev_error = error
             correction = (DRIVE_KP * error) + (DRIVE_KI * integral) + (DRIVE_KD * derivative)
-            left_speed  = max(0, min(DRIVE_SPEED, round(DRIVE_SPEED + correction)))
-            right_speed = max(0, min(DRIVE_SPEED, round(DRIVE_SPEED - correction)))
+            left_speed  = max(0, min(DRIVE_SPEED, round(DRIVE_SPEED - correction)))  # FIX 2: was + correction
+            right_speed = max(0, min(DRIVE_SPEED, round(DRIVE_SPEED + correction)))  # FIX 2: was - correction
             if abs(correction) > 0.5:
                 direction = "drifting RIGHT, slowing left & speeding right" if error > 0 else "drifting LEFT, speeding left & slowing right"
                 print(f"  [gyro fwd] {direction} | err={error:+.2f}° corr={correction:+.1f} → L={left_speed} R={right_speed}")
@@ -285,5 +303,227 @@ def rotate(angle_deg: float):
 
     LEFT_MOTOR.set_dps(0)
     RIGHT_MOTOR.set_dps(0)
+
+
+# ==========================================================================
+# ABSOLUTE HEADING ALIGN  — 3 speed intervals, 4 direction cases
+#
+#   |error| > ALIGN_FAST_THRESHOLD   → TURN_SPEED   (fast)
+#   |error| > ALIGN_MEDIUM_THRESHOLD → ALIGN_MEDIUM_SPEED (medium)
+#   |error| > ALIGN_TOLERANCE        → ALIGN_CREEP_SPEED  (creep)
+#   |error| <= ALIGN_TOLERANCE       → stop
+# ==========================================================================
+ALIGN_FAST_THRESHOLD   = 20.0   # deg: above this → fast
+ALIGN_MEDIUM_THRESHOLD = 5.0    # deg: above this → medium
+ALIGN_TOLERANCE        = 0.01   # deg: settle band
+ALIGN_MEDIUM_SPEED     = 150    # dps
+ALIGN_CREEP_SPEED      = 40     # dps — do not go below ~35 or motors stall
+ALIGN_MAX_LOOPS        = 500    # safety exit if gyro cannot reach 0.01 deg
+
+
+def align(target_angle_deg: float):
+    """
+    Rotate to an absolute heading from the startup zero (init_gyro_zero).
+
+      align(0)   -> startup facing direction
+      align(90)  -> 90 deg clockwise from zero
+      align(-90) -> 90 deg counter-clockwise from zero
+
+    Three speed intervals, four direction cases.
+    Does NOT call rotate(). Re-syncs GLOBAL_ZERO on exit.
+    """
+    global CURRENT_HEADING, GLOBAL_ZERO
+
+    dt    = 1.0 / DRIVE_CORRECTION_HZ
+    loops = 0
+    print(f"[align] target={target_angle_deg:+.1f}  "
+          f"actual={(gyro_angle() - GLOBAL_ZERO):+.1f}")
+
+    while True:
+        actual = gyro_angle() - GLOBAL_ZERO
+        error  = target_angle_deg - actual
+        loops += 1
+
+        if abs(error) <= ALIGN_TOLERANCE or loops >= ALIGN_MAX_LOOPS:
+            break
+
+        # 4 cases → 3 speed levels
+        if error > ALIGN_FAST_THRESHOLD:
+            speed =  TURN_SPEED                  # case 1: far right → fast right
+        elif error > ALIGN_MEDIUM_THRESHOLD:
+            speed =  ALIGN_MEDIUM_SPEED          # case 2: near right → medium right
+        elif error > 0:
+            speed =  ALIGN_CREEP_SPEED           # case 2b: very near right → creep right
+        elif error < -ALIGN_FAST_THRESHOLD:
+            speed = -TURN_SPEED                  # case 4: far left → fast left
+        elif error < -ALIGN_MEDIUM_THRESHOLD:
+            speed = -ALIGN_MEDIUM_SPEED          # case 3: near left → medium left
+        else:
+            speed = -ALIGN_CREEP_SPEED           # case 3b: very near left → creep left
+
+        LEFT_MOTOR.set_dps(speed)
+        RIGHT_MOTOR.set_dps(-speed if not RIGHT_MOTOR_FLIPPED else speed)
+        busy_sleep(dt)
+
+    LEFT_MOTOR.set_dps(0)
+    RIGHT_MOTOR.set_dps(0)
+    busy_sleep(0.02)
+    LEFT_MOTOR.set_position_relative(0)
+    RIGHT_MOTOR.set_position_relative(0)
+
+    raw_now         = gyro_angle_avg()
+    CURRENT_HEADING = target_angle_deg
+    GLOBAL_ZERO     = raw_now - CURRENT_HEADING
+    print(f"[align] done loops={loops}  "
+          f"settled={(gyro_angle_avg() - GLOBAL_ZERO + CURRENT_HEADING):+.1f}  "
+          f"GLOBAL_ZERO={GLOBAL_ZERO:.2f}")
+
+
+# ==========================================================================
+# ULTRASONIC HELPERS
+# ==========================================================================
+ULTRA_SAMPLES  = 5     # readings averaged per measurement
+ULTRA_STEP_CM  = 3.0   # cm driven per iteration — smaller = more accurate stop
+
+# X correction: if side reading drifts by more than this from baseline, correct
+ULTRA_X_TOLERANCE = 1.0   # cm — lateral error threshold before a correction step
+
+
+def read_ultra() -> float:
+    """
+    Take ULTRA_SAMPLES readings, drop min and max, return trimmed mean (cm).
+    """
+    readings = []
+    for _ in range(ULTRA_SAMPLES):
+        for _ in range(10):
+            val = ULTRA.get_value()
+            if val is not None:
+                readings.append(val[0] if isinstance(val, (list, tuple)) else val)
+                break
+        busy_sleep(0.02)
+    if not readings:
+        raise RuntimeError("Ultrasonic returned no valid readings.")
+    if len(readings) >= 3:
+        readings = sorted(readings)[1:-1]
+    return sum(readings) / len(readings)
+
+
+
+
+# ==========================================================================
+# DRIVE TO Y  — move along the forward axis until front reading = target_y
+#
+#   target_y: desired front ultrasonic reading (cm)
+#   smaller  = closer to the wall in front
+#   larger   = farther from the wall in front
+#
+#   Each iteration: align(0) → read Y → step forward or backward → repeat
+#   Stops when |y_now - target_y| <= ULTRA_Y_TOLERANCE
+# ==========================================================================
+ULTRA_Y_TOLERANCE = 0.5   # cm — stop when within this band of target_y
+
+
+def drive_to_y(target_y: float):
+    """
+    Drive forward or backward until the front ultrasonic reading equals target_y.
+
+      target_y < current reading  →  drive forward  (approach front wall)
+      target_y > current reading  →  drive backward (move away from front wall)
+
+    Leaves the robot facing 0 deg on exit.
+    """
+    print(f"[drive_to_y] target_y={target_y:.2f} cm")
+
+    while True:
+        align(0)
+        y_now  = read_ultra()
+        y_error = y_now - target_y   # positive → too far → drive forward
+
+        print(f"  [ultra] Y={y_now:.2f}  target={target_y:.2f}  error={y_error:+.2f}")
+
+        if abs(y_error) <= ULTRA_Y_TOLERANCE:
+            print("[drive_to_y] Y target reached.")
+            align(0)
+            break
+
+        if y_error > 0:
+            drive_forward(min(ULTRA_STEP_CM, abs(y_error)))   # approach
+        else:
+            drive_backward(min(ULTRA_STEP_CM, abs(y_error)))  # retreat
+
+
+# ==========================================================================
+# DRIVE TO X  — move along the side axis until side reading = target_x
+#
+#   target_x: desired side ultrasonic reading (cm)
+#   smaller  = closer to the side wall
+#   larger   = farther from the side wall
+#
+#   Each iteration: align(90) → read X → align(0) → step right/left → repeat
+#   Stops when |x_now - target_x| <= ULTRA_X_TOLERANCE
+# ==========================================================================
+ULTRA_X_TOLERANCE = 1.0   # cm — stop when within this band of target_x
+
+
+def drive_to_x(target_x: float):
+    """
+    Drive sideways until the side ultrasonic reading equals target_x.
+    The robot faces 90 deg to read X, then drives forward/backward at 90 deg
+    to move along the X axis, then returns to 0 deg between checks.
+
+      target_x < current reading  →  drive toward side wall  (align 90, forward)
+      target_x > current reading  →  drive away from side wall (align 90, backward)
+
+    Leaves the robot facing 0 deg on exit.
+    """
+    print(f"[drive_to_x] target_x={target_x:.2f} cm")
+
+    while True:
+        align(90)
+        x_now   = read_ultra()
+        x_error = x_now - target_x   # positive → too far from side wall → move toward it
+
+        print(f"  [ultra] X={x_now:.2f}  target={target_x:.2f}  error={x_error:+.2f}")
+
+        if abs(x_error) <= ULTRA_X_TOLERANCE:
+            print("[drive_to_x] X target reached.")
+            align(0)
+            break
+
+        if x_error > 0:
+            drive_forward(min(ULTRA_STEP_CM, abs(x_error)))   # approach side wall
+        else:
+            drive_backward(min(ULTRA_STEP_CM, abs(x_error)))  # retreat from side wall
+
+
+def align_2(x):
+    cur_angle = GYRO.get_abs_measure()
+    if x > 0:
+        if x > cur_angle:
+            while True:
+                cur_angle = GYRO.get_abs_measure()
+                #print(cur_angle)
+                error = x - cur_angle
+                error = abs(error)
+                if error == 0:
+                    LEFT_MOTOR.set_power(0)
+                    RIGHT_MOTOR.set_power(0)
+                    break
+                if error < 10:
+                    LEFT_MOTOR.set_power(11)
+                    RIGHT_MOTOR.set_power(-11)
+                else:
+                    LEFT_MOTOR.set_power(20)
+                    RIGHT_MOTOR.set_power(-20)
+
+
+if __name__ == "__main__":
+    #init_gyro_zero()
+    #drive_to_y(30)   # stop when front wall is 30 cm away
+    #drive_to_x(15)   # then slide until side wall is 15 cm away
+    align_2(180)
+    #LEFT_MOTOR.set_power(0)
+    #RIGHT_MOTOR.set_power(0)
+
 
 
